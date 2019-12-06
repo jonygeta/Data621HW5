@@ -1,0 +1,555 @@
+---
+title: "DATA 621---Assignment no. 5"
+author: "Critical Thinking Group 2"
+date: "December 5, 2019"
+output:
+  pdf_document:
+    toc: yes
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(message=FALSE, warning=FALSE)
+# Load libraries
+library(caret)
+library(ClustOfVar)
+library(corrplot)
+library(dplyr)
+library(GGally)
+library(ggplot2)
+library(mice)  # data imputation!
+library(tidyr)
+library(Metrics) #rmse
+library(MASS) #stepAIC
+library(DescTools) #pseudR2
+library(pscl) #zero-inflated 
+library(knitr)
+```
+
+# Executive Overview
+
+We build and evaluate a number of models designed to predict how many cases of particular wine is sold. Most of the independent variables relate the chemical properties of the wine itself. These include acidity, alcohol content, sulfates, and others. Each model is evaluated on a hold-out set, of 10 percent of the data.
+
+This assignment covered ten models. 
+
+- Model 1:  MLR Full Model
+- Model 2:  MLR Stepwise Full
+- Model 3:  MLR Stepwise with `AcidIndex` as Polynomial. 
+- Model 4:  Poisson Full Model
+- Model 5:  Poisson Stepwise
+- Model 6:  Poisson Stepwise with `AcidIndex` as Polynomial 
+- Model 7:  Poisson with `AcidIndex` as Polynomial and with Interactions
+- Model 8:  Negative Binomial Full Model 
+- Model 9:  Negative Binomial Model with `STARS`, `LabelAppeal` and `AcidIndex`. 
+- Model 10: Zero Inflated Poisson Model 
+
+
+\vspace{3em}
+
+Any model fit on data has the risk of being _overfit_, i.e., where the model does not capture the true relationship between the variables, but instead captures idiosyncratic details of the sample. To help avoid this outcome, we have split the dataset into `train` and `test` data frames. 
+
+Since the dataset is fairly large, we can train our models on 90 percent of the data, reserving only 10 percent for testing. All data exploration, modeling, etc., is done on the `train` set. Only at the end of this process have we examined `test`.
+
+```{r, echo=FALSE}
+df <- read.csv('wine-training-data.csv', stringsAsFactors=FALSE)
+#encountered strange characters on first column name "INDEX" 
+#https://www.roelpeters.be/removing-i-umlaut-two-dots-data-frame-column-read-csv/
+colnames(df)[1] <- gsub('^...','',colnames(df)[1])
+set.seed(1804)
+train_ix <- createDataPartition(df$TARGET, p=0.90, list=FALSE)
+train <- df[train_ix, ]
+test <- df[-train_ix, ]
+rm(df)
+print(paste('Rows in training data set:', nrow(train)))
+print(paste('Rows in test data set:', nrow(test)))
+```
+
+
+
+# Data Exploration
+
+For each wine in our `train` data set, the data provides measures of its chemical properties:
+
+| Variable           | Notes                                                                                                                     |
+|--------------------|---------------------------------------------------------------------------------------------------------------------------------|
+| TARGET             | $y$, The number of cases of wine sold                                                                                                |
+| AcidIndex          | Measure of overall acidity                                                                                                      |
+| Alcohol            |              |
+| Chlorides          | Chloride content, related to saltiness                                                                                                   |
+| CitricAcid         |                                                                                                         |
+| Density            | Measure of density: weight-to-volume ratio                                                                                      |
+| FixedAcidity       |  |
+| FreeSulfurDioxide  | Free $SO_2$ functions as a preservative |
+| LabelAppeal        | Expert score of the label design                                                                                                |
+| ResidualSugar      | Sugar remaining after fermentation                                                                                              |
+| STARS              | Expert wine rating from 1 to 4                                                                                                  |
+| Sulphates          | Measure of sulfates (salts of sulfuric acid)                                                                                    |
+| TotalSulfurDioxide |                                                                                                                                 |
+| VolatileAcidity    | Volatile acid is related to wines' aroma                                                                                        |
+| pH                 |            
+
+
+
+## Missing values
+
+The table below provides the number of missing values for each variable in `train`:
+
+```{r}
+sort(sapply(train, function(x) sum(is.na(x))))
+```
+
+Most independent variables are missing between five and six hundred observations, or about 5 percent.
+
+However, the expert rating variable `STARS` is missing over a quarter! Exploratory analysis will determine if this variable is particularly informative regarding sales. If it proves to be, an imputation strategy is recommended.
+
+
+
+
+## Distribution of independent variables
+
+```{r}
+train %>%
+  dplyr::select(-INDEX) %>%
+  gather() %>% 
+  ggplot(aes(value)) +
+    facet_wrap(~ key, scales='free') +
+    geom_histogram(colour='black', fill='white')
+```
+
+Our main variable of interest, the number of boxes of wine sold, `TARGET` in the graph, has an almost-normal shape to it (except discrete). The plurality of wines sold about four boxes.
+
+However, notice the big bulge of wines that sell zero boxes. Zero is the second largest category. **This suggests the use of zero-inflated models will be appropriate for modeling this variable.**
+
+Most of the other variables also seem to have a large bulge at and around zero, e.g., chlorides, fixed acidity, density, and then a more uniform distribution immediately surrounding it.
+
+The expert ratings, `STARS`, rates 70 percent of wines at one or two. Another 23 percent is rated as a three, leaving only 6 percent to be rated at the highest score, four stars.
+
+```{r}
+round(prop.table(table(train$STARS)), 4)
+```
+
+_Outliers_: Visual inspection suggests there are no obvious one-off data entry errors. However, many of the chemical variables are dispersed over a large range. It may make sense to transform these data to be narrower. Since the data often includes negative variables, a log transformation would be inappropriate. **If necessary, use square root transformation to reduce variance of variables.**
+
+
+
+## Relationship to wine sales
+
+Plot all independent variables against wine sales:
+
+```{r}
+train %>%
+  dplyr::select(-INDEX) %>%
+  gather(-TARGET, key='variable', value='value') %>%
+  ggplot(aes(x=jitter(value), y=jitter(TARGET))) +
+  geom_point(alpha=0.05) +
+  geom_smooth() +
+  facet_wrap(~ variable, scales='free')
+```
+
+(Because the data is discrete, I have jitted both axes and made the points partially transparent to make the relationships more obvious.)
+
+To our eyes, there are only three relationships that could be plausibly relevant to wine sales. The acid index has a curve around 10, suggesting that extra-acidic wines sell less. There is a reasonably linear and positive relationship between the label's graph design and sales. Finally, better rated wine tends to be purchased more.
+
+
+
+## Correlation
+
+As the plot below shows, there is strikingly little correlation among the variables. Even though multiple variables are different measures of different types of acidity, none of them are even minimally correlated!
+
+```{r}
+corrplot(cor(na.omit(train)), type='upper', method='number', order='hclust', number.cex=0.55)
+```
+
+The correlation between wine sales and expert rating is the only strong correlation in the chart (0.62). This suggests that our intuition was correct regarding the value of `STARS`, further suggesting that we may have lost a lot of predictive power had we not imputed the missing values.
+
+Otherwise, wine sales are only weakly correlated with two variables: `AcidIndex` (-0.25), and `LabelAppeal` (0.36).
+
+
+
+## Independent variable clusters
+
+We can use the `ClustOfVar` package to further study our independent variables, via hierarchical clustering:
+
+```{r}
+plot(hclustvar(train[3:16]))
+```
+
+This suggests five main groupings of variables. It is clear that the first group of `LabelAppeal` and `STARS` can be thought of as social recognition. The second, composed of measures of residual sugar and sulfuric dioxide, could be considered as a 'fermentation axis.' The third contains most measures of acidity.
+
+We cannot judge, even subjectively, what phenomena the last two clusters could be picking up on. Doubtless it is some chemical axes we are not qualified to speculate on.
+
+
+# Data Preparation
+
+The main purpose of this section is to describe missing data imputation.
+
+We saw above that a quarter of wines in the training sample are missing an expert rating, `STARS`. We also saw this variable is our only variable strongly correlated with the dependent variable. Thus we are choosing to impute missing variables.
+
+Imputation is handled with the `mice` package. The documentation explains:
+
+> The package creates multiple imputations (replacement values) for multivariate missing data. The method is based on Fully Conditional Specification, where each incomplete variable is imputed by a separate model.
+
+```{r}
+# NOTE: This process may take a minute or two
+mice_imputation <- mice(train, print=FALSE, seed=1804)
+train_imp <- mice::complete(mice_imputation)
+train_imp <- subset(train_imp, select = -c(INDEX)) #drop INDEX column 
+train_imp$STARS <- factor(train_imp$STARS) #convert STARS as factor 
+# no missing data!
+sort(sapply(train_imp, function(x) sum(is.na(x))))
+```
+
+# Comparision of variables with `TARGET` of zero and greater than zero 
+
+Two data frames are generated below. One data frame that contains observations with `TARGET` value of zero. The other data frame only contains observations with `TARGET` greater than zero. 
+
+Comparing the distributions of the different variables, it appears that for `TARGET` value of zero, only observations with `STARS` of 1 and 2 are included in this data set. Those with `TARGET` values greater than zero range from 1 through 4 in terms of `STARS` rating. 
+
+The distribution of `LabelAppeal` is similar for both categories along with most of the other variables. 
+
+For `AcidIndex`, it appears that most observations with `TARGET` > 0 the `AcidIndex` tends to be on the higher side. 
+
+```{r}
+train_imp_zero <- subset(train_imp, TARGET == 0)
+train_imp_notZero <- subset(train_imp, TARGET > 0)
+
+par(mfrow = c(1, 2))
+
+train_imp_zero %>%
+  gather() %>% 
+  ggplot(aes(value)) +
+    facet_wrap(~ key, scales='free') +
+    geom_histogram(colour='black', fill='white', stat="count") + ggtitle("TARGET = 0")
+
+train_imp_notZero %>%
+  gather() %>% 
+  ggplot(aes(value)) +
+    facet_wrap(~ key, scales='free') +
+    geom_histogram(colour='black', fill='white', stat="count") + ggtitle("TARGET > 0")
+```
+
+# `STARS` and `AcidIndex` 
+
+The plot below shows relationship between `STARS` and `AcidIndex`, which shows that the relationship between TARGET and AcidIndex is different depending on STARS. 
+
+```{r}
+ggplot(train_imp, aes(x=AcidIndex, y=TARGET, group=as.factor(STARS), color=as.factor(STARS))) +
+  geom_line() +
+  geom_smooth()
+```
+
+
+# Modeling
+
+Each model provides values for $RMSE$, $AIC$, and $R^2$. 
+
+## $M_0$: Dummy Model
+
+This is the baseline model, which has zero predictive power ($R^2$ of 0). The $RMSE$ is 1.927055. The $AIC$ is 47802.12. 
+
+Relative to $m_0$, the other models should have higher $R^2$, lower $RMSE$, and lower $AIC$. 
+
+```{r}
+m_0 <- lm(TARGET ~ 1, train_imp)
+```
+
+```{r}
+summary(m_0)$r.squared
+AIC(m_0)
+```
+
+```{r}
+pred_0 <- predict(m_0, train_imp)
+Metrics::rmse(train_imp$TARGET, pred_0)
+```
+
+## $M_1$: Multiple Linear Regression Full model 
+
+The simplest multiple linear model is the full model, which includes all variables without doing any transformations. Most of the independent variables are shown to be significant. The adjusted $R^2$ is 0.4702. The $RMSE$ is 1.401683, which is lower than the dummy model $m_0$. The $AIC$ is 40501.31, which is also lower than $m_0$. 
+
+
+```{r}
+m_1 <- lm(TARGET ~., train_imp)
+summary(m_1)
+```
+
+
+```{r}
+pred_1 <- predict(m_1, train_imp)
+Metrics::rmse(train_imp$TARGET, pred_1)
+AIC(m_1)
+```
+
+## $M_2$: Stepwise Multiple Linear Regression Model 
+
+This multiple linear regression model is generated through step wise forward selection and backward elimination. The resulting model includes 12 of the 14 independent variables. `FixedAcidity` and `ResidualSugar` were dropped. The adjusted $R^2$ is 0.4702. The $RMSE$ is 1.401751. The $AIC$ is 40498.44, which is lower than $m_1$. 
+
+```{r}
+m_2 <- step(lm(TARGET~., data=train_imp), direction="both", trace=0)
+summary(m_2)
+```
+
+
+```{r}
+pred_2 <- predict(m_2, train_imp)
+Metrics::rmse(train_imp$TARGET, pred_2)
+AIC(m_2)
+```
+
+## $M_3$: Stepwise Multiple Linear Regression with `AcidIndex` as Polynomial 
+
+In this multiple linear regression model, the adjusted $R^2$ is 0.4731. The $RMSE$ is 1.397907. The $AIC$ is 40437.17. Model $m_3$ appears to be better compared to $m_1$ and $m_2$. In this model, `FixedAcidity`, `ResidualSugar`, and `CitricAcid` were dropped.
+
+
+```{r}
+m_3 <- step(lm(TARGET~ STARS + LabelAppeal + poly(AcidIndex, 3) + ., data=train_imp), direction="both", trace=0)
+summary(m_3)
+```
+
+
+```{r}
+pred_3 <- predict(m_3, train_imp)
+Metrics::rmse(train_imp$TARGET, pred_3)
+AIC(m_3)
+```
+
+
+## $M_4$: Poisson Full Model
+
+
+One of the assumptions of a Poisson regression model is that the variance and mean of the dependent variable are the same. The variance of the target variable is 3.713862 and the mean is 3.030127. This model includes all independent variables. The Nagelkerke $R^2$ is 0.4527626. The $RMSE$ is 1.401879. The $AIC$ is 42560.
+
+
+```{r}
+var(train_imp$TARGET)
+mean(train_imp$TARGET)
+```
+
+```{r}
+m_4 <- glm(TARGET ~., family = poisson(link = "log"), data=train_imp)
+summary(m_4)
+```
+
+```{r}
+PseudoR2(m_4, which = 'Nagelkerke')
+```
+
+```{r warning=FALSE}
+pred_4 <- predict(m_4, train_imp, type="response")
+Metrics::rmse(train_imp$TARGET, pred_4)
+```
+
+
+## $M_5$: Stepwise Poisson Model 
+
+In this step wise Poisson regression model, all the variables are included in the step wise process. In this model, `FixedAcidity`, `ResidualSugar`, and `CitricAcid` were dropped. 
+The remaining variables appear to be significant. The Nagelkerke pseudo $R^2$ is 0.4526647. The $RMSE$ is  1.402057. The $AIC$ is 42556 (lower than $m_4$). 
+
+```{r}
+m_5 <- step(glm(TARGET ~., family = poisson(link = "log"), data=train_imp), direction="both", trace=0)
+summary(m_5)
+```
+
+```{r}
+PseudoR2(m_5, which = 'Nagelkerke')
+```
+
+```{r warning=FALSE}
+pred_5 <- predict(m_5, train_imp, type="response")
+Metrics::rmse(train_imp$TARGET, pred_5)
+```
+
+
+## $M_6$: Stepwise Poisson with `AcidIndex` as Polynomial 
+
+In this step wise Poisson regression all the variables are included in the step wise selection. Variables `FixedAcidity`, `ResidualSugar`, and `CitricAcid` were dropped.
+The Nagelkerke pseudo $R^2$ is 0.4571626. The $RMSE$ is 1.396192 (lower than $m_5$ and $m_4$). The $AIC$ is 42468 (lower than $m_5$). 
+
+```{r}
+m_6 <- step(glm(TARGET~ STARS + LabelAppeal + poly(AcidIndex, 3) + ., family = poisson(link = "log"), data=train_imp), direction="both", trace=0)
+summary(m_6)
+```
+
+```{r}
+PseudoR2(m_6, which = 'Nagelkerke')
+```
+
+```{r warning=FALSE}
+pred_6 <- predict(m_6, train_imp, type="response")
+Metrics::rmse(train_imp$TARGET, pred_6)
+```
+
+## $M_7$: Poisson with `AcidIndex` as Polynomial and with Interactions
+
+This Poisson model only looks at three explanatory variables: `AcidIndex`, `LabelAppeal`, and `STARS` with interaction terms. 
+
+The Nagelkerke pseudo $R^2$ is 0.4706884. The $RMSE$ is 1.376506. The $AIC$ is 42187. This model appears to be the best one within the Poisson models. 
+ 
+```{r}
+m_7 <- step(glm(TARGET~ STARS + LabelAppeal + poly(AcidIndex, 3)*STARS , family = poisson(link = "log"), data=train_imp), direction="both", trace=0)
+summary(m_7)
+```
+
+```{r}
+PseudoR2(m_7, which = 'Nagelkerke')
+```
+
+```{r warning=FALSE}
+pred_7 <- predict(m_7, train_imp, type="response")
+Metrics::rmse(train_imp$TARGET, pred_7)
+```
+
+
+## $M_8$: Negative Binomial Full Model 
+
+The variance of dependent variable (3.713862) is greater than the mean (3.030127). Negative binomial regression might provide a better fit. 
+
+This model includes all 14 variables. Some of the variables do not seem to be significant. The Nagelkerke pseudo $R^2$ is 0.4527417. The $RMSE$ is 1.40188. The $AIC$ is 42563. 
+
+There is a warning that says "Warning while fitting theta: iteration limit reached". The $theta$ value is very large. This tells us that the data is closer to Poisson. The data is not "dispersed" enough about the mean. 
+
+https://stats.stackexchange.com/questions/323968/theta-going-towards-infinity-in-negative-binomial-model
+
+http://r-sig-ecology.471788.n2.nabble.com/Very-large-dispersion-parameter-in-a-negative-binomial-model-td7577858.html
+
+
+```{r}
+summary(m_8 <- glm.nb(TARGET ~ ., data = train_imp))
+```
+
+```{r}
+PseudoR2(m_8, which = 'Nagelkerke')
+```
+
+```{r warning=FALSE}
+pred_8 <- predict(m_8, train_imp, type="response")
+Metrics::rmse(train_imp$TARGET, pred_8)
+```
+
+## $M_9$: Negative Binomial Regression Model with only `STARS`, `LabelAppeal` and `AcidIndex` 
+
+In this negative binomial model, only three variables are used. The Nagelkerke pseudo $R^2$ is 0.4529641. The $RMSE$ is 1.400095. The $AIC$ is 42540. 
+
+There is a warning that says "Warning while fitting theta: iteration limit reached". The $theta$ value is very large. This tells us that the data is closer to Poisson. The data is not "dispersed" enough about the mean. 
+
+```{r}
+m_9 <- glm.nb(TARGET~ STARS + LabelAppeal + poly(AcidIndex, 3), data = train_imp)
+summary(m_9)
+```
+
+```{r}
+PseudoR2(m_9, which = 'Nagelkerke')
+```
+
+```{r warning=FALSE}
+pred_9 <- predict(m_9, train_imp, type="response")
+Metrics::rmse(train_imp$TARGET, pred_9)
+```
+
+## $M_10$: Zero Inflated Poisson Regression Model 
+
+This model is based on three explanatory variables: `STARS`, `LabelAppeal`, and `AcidIndex`. 
+
+The Vuong test below shows that the zero-inflated model performs better than the ordinary Poisson model. 
+
+The $RMSE$ is 1.38889. The $AIC$ is 38373.25 (lowest among all the models). 
+
+```{r}
+m_10 <- zeroinfl(TARGET ~ STARS + LabelAppeal + poly(AcidIndex, 3)*STARS | poly(AcidIndex, 3)*STARS, data = train_imp)
+summary(m_10)
+```
+
+```{r}
+AIC(m_10)
+```
+
+```{r warning=FALSE}
+pred_10 <- predict(m_10, train_imp, type="response")
+Metrics::rmse(train_imp$TARGET, pred_10)
+```
+
+Perform the Vuong test to see if the zero-inflated model is better than Poisson. This test compares the zero-inflated model with the simple Poisson model. 
+
+The result below show that test statistic is significant, which indicates that the zero-inflated model is better than the Poisson model. 
+
+```{r}
+m_11 <- glm(TARGET~ STARS + LabelAppeal + poly(AcidIndex, 3), family = poisson(link = "log"), data=train_imp) #Reference poisson 
+vuong(m_11, m_10)
+```
+
+# Evaluating the Models on the Test Set
+
+We're only considering complete cases in the test set. There are 635 complete cases in the test set.
+
+All 10 models are evaluated against the test set based on $RMSE$ and the weighted average of the distance of the prediction from the actual count. 
+
+```{r}
+test$STARS <- as.factor(test$STARS)
+test <- subset(test, select = -c(INDEX)) #drop INDEX column 
+test <- test[complete.cases(test),] #consider only complete cases 
+test_pred_1 <- predict(m_1, test, type="response")
+test_pred_2 <- predict(m_2, test, type="response")
+test_pred_3 <- predict(m_3, test, type="response")
+test_pred_4 <- predict(m_4, test, type="response")
+test_pred_5 <- predict(m_5, test, type="response")
+test_pred_6 <- predict(m_6, test, type="response")
+test_pred_7 <- predict(m_7, test, type="response")
+test_pred_8 <- predict(m_8, test, type="response")
+test_pred_9 <- predict(m_9, test, type="response")
+test_pred_10 <- predict(m_10, test, type="response")
+```
+
+```{r}
+test_rmse <- 
+c( Metrics::rmse(test$TARGET, round(test_pred_1)), 
+Metrics::rmse(test$TARGET, round(test_pred_2)), 
+Metrics::rmse(test$TARGET, round(test_pred_3)), 
+Metrics::rmse(test$TARGET, round(test_pred_4)), 
+Metrics::rmse(test$TARGET, round(test_pred_5)), 
+Metrics::rmse(test$TARGET, round(test_pred_6)), 
+Metrics::rmse(test$TARGET, round(test_pred_7)), 
+Metrics::rmse(test$TARGET, round(test_pred_8)), 
+Metrics::rmse(test$TARGET, round(test_pred_9)), 
+Metrics::rmse(test$TARGET, round(test_pred_10)))
+```
+
+```{r}
+test_aveDistance <- 
+c(weighted.mean(abs(test$TARGET - round(test_pred_1))),
+weighted.mean(abs(test$TARGET - round(test_pred_2))),
+weighted.mean(abs(test$TARGET - round(test_pred_3))),
+weighted.mean(abs(test$TARGET - round(test_pred_4))),
+weighted.mean(abs(test$TARGET - round(test_pred_5))),
+weighted.mean(abs(test$TARGET - round(test_pred_6))),
+weighted.mean(abs(test$TARGET - round(test_pred_7))),
+weighted.mean(abs(test$TARGET - round(test_pred_8))),
+weighted.mean(abs(test$TARGET - round(test_pred_9))),
+weighted.mean(abs(test$TARGET - round(test_pred_10))))
+```
+
+```{r echo=FALSE}
+model_desc<- 
+c(
+"M1: MLR Full Model",
+"M2: MLR Stepwise Full",
+"M3: MLR Stepwise with AcidIndex as Polynomial",
+"M4: Poisson Full Model",
+"M5: Poisson Stepwise",
+"M6: Poisson Stepwise with AcidIndex as Polynomial",
+"M7: Poisson with AcidIndex as Polynomial with Interactions",
+"M8: Negative Binomial Full Model", 
+"M9: Negative Binomial Model with STARS, LabelAppeal, AcidIndex", 
+"M10:Zero Inflated Poisson Model"
+)
+```
+
+```{r echo=FALSE}
+kable(cbind(model_desc, test_rmse, test_aveDistance))
+```
+
+
+## Conclusion and Inferences
+
+The winning model based on $RMSE$ is $M9: Negative Binomial Model with STARS, LabelAppeal, AcidIndex$ with an $RMSE$ value of 1.2499. 
+
+The winning model based on weighted average of the distance of the prediction from the actual count is $M7: Poisson with AcidIndex as Polynomial with Interactions$ at 0.9087.
+
